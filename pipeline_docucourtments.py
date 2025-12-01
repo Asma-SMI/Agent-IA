@@ -74,6 +74,7 @@ def split_document_to_image_paths(
 # B) Prompts
 # ---------------------------
 
+# Prompt classify
 CLASSIFIER_PROMPT = """
 Tu es un système de classification de documents.
 Analyse l'image fournie et identifie le type de document.
@@ -129,35 +130,56 @@ Important:
 
 # Prompt structuration V2 (aligné sur tes champs finaux)
 STRUCTURE_FROM_TEXT_PROMPT_V2 = """
-Tu reçois le texte d'un ETAT D'APUREMENT item par item.
+Tu reçois le texte OCR d’un ETAT D’APUREMENT item par item.
 
 Texte:
 {items_text}
 
-Objectif: transformer en JSON strict.
+BUT: produire un JSON strict.
 
-Pour chaque item, extrais uniquement:
-- ia_reg : banque/institution citée (UIB, BIAT, BNA, SMI, ATB, etc.) sinon null.
-- num_dom : numéro après "Titre N°" ou "Titre export N°" (garder seulement chiffres).
-- date_dom : date liée au titre/domiciliation si présente.
-- mnt_reglement : montant principal lié à l’item.
-- devise : EUR/USD/TND/CHF si présente sinon null.
-- date_reglement : date de règlement/paiement si écrite.
-- justificatif : nature de la preuve (ex: "Facture", "Reçu", "SWIFT", etc.) si visible sinon null.
+RÈGLES CRITIQUES:
+1) DATE D’EN-TÊTE:
+- La date en haut du document (ex: "Tunis, le 20/05/2025") est une date_document GLOBALE.
+- Tu NE dois JAMAIS la mettre dans date_dom d’un item.
+- date_dom peut être remplie UNIQUEMENT si une date est écrite DANS l’item
+  et liée au titre / domiciliation. Sinon date_dom = null.
 
-Règles:
-- Ne devine jamais.
+2) num_dom (N° TITRE):
+- Extrais num_dom seulement si tu vois dans l’item un motif de titre:
+  "Titre N°", "Titre No", "Titre N'", "Titre NP","/Titre N°",
+  "Titre export N°", "Titre export No", "Titre export NP"
+  suivi de chiffres (>=5).  
+- num_dom = ces chiffres.  
+- Si pas de motif titre -> null.
+- Ne prends JAMAIS un montant comme num_dom.
+
+3) facture:
+- Extrais facture seulement si tu vois "Facture" ou "Fact" ou "FACT"
+  suivi d’un numéro de type 058/2014, 23/14, 5/2014, etc.
+- facture = "058/2014" ou "23/14" etc.
+- Si absent -> null.
+
+4) mnt_reglement / devise:
+- mnt_reglement = montant principal de la phrase principale de l’item.
+- devise = devise associée à ce montant principal (CHF/EUR/TND/USD).
+- Ignore la devise des phrases "à apurer par ..." et des réimputations.
+
+5) reimputations:
+- Sous-lignes qui contiennent "Titre ... (Fact ..) = montant devise"
+- Elles peuvent commencer par "-" OU directement par "Titre".
+- Pour chaque réimputation, extrais:
+  num_dom, facture, mnt_reglement, devise.
+
+IMPORTANT:
+- Ne devine rien.
 - Si absent/illisible => null.
-- num_dom = uniquement chiffres.
-- mnt_reglement = nombre sans texte (ex: 9150.0).
-- date = format YYYY-MM-DD si possible sinon laisse tel quel ou null.
-- Si plusieurs montants existent, prends celui qui correspond au règlement principal.
 
 Réponds UNIQUEMENT en JSON valide:
-{
+{{
   "doc_type": "etat_apurement",
+  "date_document": null,
   "items": [
-    {
+    {{
       "numero_item": null,
       "ia_reg": null,
       "num_dom": null,
@@ -165,10 +187,12 @@ Réponds UNIQUEMENT en JSON valide:
       "mnt_reglement": null,
       "devise": null,
       "date_reglement": null,
-      "justificatif": null
-    }
+      "facture": null,
+      "justificatif": null,
+      "reimputations": []
+    }}
   ]
-}
+}}
 """
 
 # Extraction générique (si doc_type != etat_apurement)
@@ -245,7 +269,6 @@ def enhance_image_for_ocr(img_path: str) -> str:
 
 
 _reader = None
-
 def ocr_text(img_path: str) -> str:
     global _reader
     if _reader is None:
@@ -424,6 +447,50 @@ def normalize_items_text(ocr_txt: str) -> str:
 
     return "\n".join(out).strip()
 
+def looks_like_date(s: Any) -> bool:
+    if not isinstance(s, str):
+        return False
+    return bool(
+        re.search(
+            r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}",
+            s
+        )
+    )
+
+
+def fold_orphan_items_as_reimputations(ext: Dict[str, Any]) -> Dict[str, Any]:
+    items = ext.get("items", [])
+    if not items:
+        return ext
+
+    cleaned = []
+    orphans = []
+
+    for it in items:
+        num_item = it.get("numero_item")
+        # orphan = item sans numero_item mais qui ressemble à une réimputation
+        if (num_item is None or str(num_item).strip() == "") and it.get("num_dom") and it.get("mnt_reglement"):
+            orphans.append(it)
+        else:
+            cleaned.append(it)
+
+    # on attache les orphans au DERNIER item réel (souvent item 8/9)
+    if cleaned and orphans:
+        parent = cleaned[-1]
+        if "reimputations" not in parent or parent["reimputations"] is None:
+            parent["reimputations"] = []
+
+        for o in orphans:
+            parent["reimputations"].append({
+                "num_dom": clean_titre_no(o.get("num_dom")),
+                "facture": clean_facture_no(o.get("facture")),
+                "mnt_reglement": to_float(o.get("mnt_reglement")),
+                "devise": o.get("devise")
+            })
+
+    ext["items"] = cleaned
+    return ext
+
 # ---------------------------
 # F) Stage runners (prompt par prompt)
 # ---------------------------
@@ -445,16 +512,6 @@ def run_classification(llm, data_url: str, ocr_txt: str) -> Dict[str, Any]:
     cls["doc_type"] = normalize_doc_type(cls.get("doc_type", "autre"))
     return cls
 
-
-# def run_items_ocr(llm, data_url: str) -> str:
-#     msgs = [
-#         SystemMessage(content=OCR_ITEMS_PROMPT),
-#         HumanMessage(content=[
-#             {"type": "text", "text": "Recopie fidèlement les items numérotés selon le format demandé."},
-#             {"type": "image_url", "image_url": data_url}
-#         ])
-#     ]
-#     return llm.invoke(msgs).content
 
 def run_items_ocr_only_easyocr(img_path: str, use_enhanced=True) -> str:
     # OCR sur image améliorée pour max recall
@@ -493,27 +550,97 @@ def run_generic_extraction(llm, data_url: str, ocr_txt: str, doc_type: str) -> D
 # G) Post-processing final schema
 # ---------------------------
 
+# def post_process_etat_apurement(ext: Dict[str, Any], page_filename: str) -> Dict[str, Any]:
+#     # récupère date d’en-tête si le LLM l’a mise
+#     header_date = ext.get("date_document")
+
+#     for it in ext.get("items", []):
+#         if not isinstance(it, dict):
+#             continue
+
+#         # numero_item -> chiffres uniquement
+#         if it.get("numero_item"):
+#             m = re.search(r"\d{1,2}", str(it["numero_item"]))
+#             it["numero_item"] = m.group(0) if m else it["numero_item"]
+
+#         # num_dom nettoyage
+#         it["num_dom"] = clean_titre_no(it.get("num_dom"))
+
+#         # si num_dom trop court -> null
+#         if it.get("num_dom") and len(str(it["num_dom"])) < 5:
+#             it["num_dom"] = None
+
+#         # montant float
+#         it["mnt_reglement"] = to_float(it.get("mnt_reglement"))
+
+#         # si num_dom == montant -> annuler num_dom
+#         if it.get("num_dom") and it.get("mnt_reglement") is not None:
+#             try:
+#                 nd = str(it["num_dom"])
+#                 mt = str(int(float(it["mnt_reglement"])))
+#                 if nd == mt:
+#                     it["num_dom"] = None
+#             except:
+#                 pass
+
+#         # devise normalisée
+#         d = it.get("devise")
+#         if isinstance(d, str) and "EURO" in d.upper():
+#             it["devise"] = "EUR"
+
+#         # ✅ anti-fuite date en-tête
+#         if header_date and it.get("date_dom") == header_date:
+#             it["date_dom"] = None
+#         # ou si date_dom == date du doc dans le texte
+#         if it.get("date_dom") and re.search(r"\b20/05/2025\b", str(it["date_dom"])):
+#             it["date_dom"] = None
+
+#         # page
+#         it["page"] = page_filename
+
+#     return ext
 def post_process_etat_apurement(ext: Dict[str, Any], page_filename: str) -> Dict[str, Any]:
+    header_date = ext.get("date_document")
+
     for it in ext.get("items", []):
         if not isinstance(it, dict):
             continue
 
-        # normalisation num_dom
+        # numero_item -> chiffres uniquement
+        if it.get("numero_item"):
+            m = re.search(r"\d{1,2}", str(it["numero_item"]))
+            it["numero_item"] = m.group(0) if m else it["numero_item"]
+
+        # num_dom nettoyage
         it["num_dom"] = clean_titre_no(it.get("num_dom"))
 
-        # montant float
+        if it.get("num_dom") and len(str(it["num_dom"])) < 5:
+            it["num_dom"] = None
+
         it["mnt_reglement"] = to_float(it.get("mnt_reglement"))
 
-        # devise simple
+        # devise normalisée
         d = it.get("devise")
         if isinstance(d, str) and "EURO" in d.upper():
             it["devise"] = "EUR"
 
-        # ajout page
+        # anti-fuite date en-tête
+        if header_date and it.get("date_dom") == header_date:
+            it["date_dom"] = None
+        if it.get("date_dom") and re.search(r"\b20/05/2025\b", str(it["date_dom"])):  # optionnel
+            it["date_dom"] = None
+
+        # ✅ facture : si c'est juste une année -> null
+        if it.get("facture") and re.fullmatch(r"\d{4}", str(it["facture"]).strip()):
+            it["facture"] = None
+
+        # ✅ justificatif: tu ne veux PAS Avance/Surplus/Manque ici
+        if it.get("justificatif"):
+            it["justificatif"] = None
+
         it["page"] = page_filename
 
     return ext
-
 
 # ---------------------------
 # H) Full pipeline + staging
@@ -537,9 +664,6 @@ def process_document(
 
     results = []
     for path in page_paths:
-        # clean_path = enhance_image_for_ocr(path)
-        # ocr_txt = ocr_text(clean_path) if use_ocr else ""
-        # data_url = image_path_to_data_url(clean_path)
         enh_path = enhance_image_for_ocr(path)
         ocr_txt = ocr_text(enh_path) if use_ocr else ""
         data_url = image_path_to_data_url(path)
@@ -585,13 +709,34 @@ def process_document(
             # 2) structuration LLM
             ext = run_structure_items(llm, items_text)
 
+            # forcer numero_item à partir de l'ordre réel
+            real_nums = list(item_text_map.keys())  # ex: ["1","2","3"...]
+            for i, it in enumerate(ext.get("items", [])):
+                if i < len(real_nums):
+                    it["numero_item"] = real_nums[i]
+
             # 3) ajouter reimputations par item
             for it in ext.get("items", []):
                 if not isinstance(it, dict):
                     continue
                 num = str(it.get("numero_item", "")).strip()
                 raw_text = item_text_map.get(num, "")
+                # ---- override num_dom & facture depuis texte brut (fiable) ----
+                mt = re.search(r"(titre(?:\s+export)?\s*n[°o'Pp]?\s*)(\d{5,})", raw_text, re.IGNORECASE)
+                if mt:
+                    it["num_dom"] = mt.group(2)
+
+                mf = re.search(
+                    r"(?:facture|fact|FACT)\s*(?:n[°o]\s*)?[:#]?\s*(\d{1,4}\s*/\s*\d{2,4})",
+                    raw_text,
+                    re.IGNORECASE
+                )
+                if mf:
+                    it["facture"] = mf.group(1).replace(" ", "")
                 it["reimputations"] = extract_reimputations(raw_text)
+
+            ext = fold_orphan_items_as_reimputations(ext)
+            ext = post_process_etat_apurement(ext, page_file)
 
             # 4) post process final
             ext = post_process_etat_apurement(ext, page_file)
