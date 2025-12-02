@@ -146,7 +146,7 @@ RÈGLES CRITIQUES:
 
 2) num_dom (N° TITRE):
 - Extrais num_dom seulement si tu vois dans l’item un motif de titre:
-  "Titre N°", "Titre No", "Titre N'", "Titre NP","/Titre N°",
+  "Titre N°", "Titre No", "Titre N'", "Titre NP","/Titre N°", "Titre",
   "Titre export N°", "Titre export No", "Titre export NP"
   suivi de chiffres (>=5).  
 - num_dom = ces chiffres.  
@@ -255,14 +255,11 @@ def enhance_image_for_ocr(img_path: str) -> str:
     if img is None:
         return img_path
 
-    # débruitage léger
     img = cv2.GaussianBlur(img, (3, 3), 0)
 
-    # contraste doux
     clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
     img = clahe.apply(img)
 
-    # PAS de binarisation dure
     out_path = img_path.replace(".png", "_enh.png")
     cv2.imwrite(out_path, img)
     return out_path
@@ -336,22 +333,11 @@ def clean_titre_no(x: Any) -> Optional[str]:
     return nums[0] if nums else None
 
 def clean_facture_no(x: Any) -> Optional[str]:
-    """
-    Extrait un numéro de facture depuis une ligne OCR.
-    Supporte :
-      - Facture 058/2014
-      - (Fact 24/14)
-      - FACT 23/14
-      - Facture N° 050/2014
-      - 5/2014, 42/14, etc.
-    Retourne format compact sans espaces, ex: "058/2014" ou "24/14".
-    """
     if not isinstance(x, str):
         return None
 
     s = x.strip()
 
-    # 1) motifs explicites Fact/FACT/Facture
     m = re.search(
         r"(?:facture|fact|FACT)\s*(?:n[°o]\s*)?[:#]?\s*(\d{1,4}\s*/\s*\d{2,4})",
         s,
@@ -360,14 +346,11 @@ def clean_facture_no(x: Any) -> Optional[str]:
     if m:
         return m.group(1).replace(" ", "")
 
-    # 2) motif simple "058/2014" ou "23/14" n'importe où
     m2 = re.search(r"(\d{1,4}\s*/\s*\d{2,4})", s)
     if m2:
         return m2.group(1).replace(" ", "")
 
-    # 3) fallback: un bloc de 2-4 chiffres seul (rare)
-    m3 = re.search(r"\b\d{2,4}\b", s)
-    return m3.group(0) if m3 else None
+    return None 
 
 
 def extract_reimputations(raw_text: str) -> List[Dict[str, Any]]:
@@ -411,10 +394,27 @@ def normalize_items_text(ocr_txt: str) -> str:
     if not ocr_txt:
         return ocr_txt
 
-    # 1) split grossier en lignes
     lines = [l.rstrip() for l in ocr_txt.splitlines()]
 
     out = []
+    prev_line = ""
+
+    ITEM_START_WORDS = [
+        "une", "un", "avance", "surplus", "manque",
+        "a apurer", "apurer", "apuré", "apuré par",
+        "réimputer", "ré imput", "reimputer"
+    ]
+
+    def looks_like_real_item(rest: str) -> bool:
+        if not rest:
+            return False
+        r = rest.strip().lower()
+        return any(r.startswith(w) for w in ITEM_START_WORDS)
+
+    def prev_looks_like_amount(line: str) -> bool:
+        # ex: finit par "7.172" ou "7 172" ou "7172"
+        return bool(re.search(r"(\d{1,3}(?:[.\s]\d{3})+|\d+)$", line.strip()))
+
     for l in lines:
         s = l.strip()
         if not s:
@@ -422,30 +422,69 @@ def normalize_items_text(ocr_txt: str) -> str:
 
         # cas "1" seul => "1)"
         if re.fullmatch(r"\d{1,2}", s):
-            s = s + ")"
+            s += ")"
 
         # cas "4 Un ..." => "4) Un ..."
-        s = re.sub(r"^(\d{1,2})\s+(?=\S)", r"\1) ", s)
+        s = re.sub(r"^(\d{1,3})\s+(?=\S)", r"\1) ", s)
 
-        # 2) ✅ split si un item apparaît au milieu de ligne: "... 6 Un ..."
-        # on insère un retour ligne avant " 6) " ou " 6 "
-        s = re.sub(r"\s+(\d{1,2})\s+(?=[A-Za-zÀ-ÿ])", r"\n\1) ", s)
+        # split si nouvel item au milieu ligne: "... 6 Un ..."
+        s = re.sub(r"\s+(\d{1,3})\s+(?=[A-Za-zÀ-ÿ])", r"\n\1) ", s)
 
-        # 3) re-split si on a inséré des \n
         for part in s.split("\n"):
             part = part.strip()
             if not part:
                 continue
 
-            # ligne vide avant chaque nouvel item
-            if re.match(r"^\d{1,2}\)", part):
+            m = re.match(r"^(\d{1,3})\s*[\)\.\-:]\s*(.*)$", part)
+            if not m:
+                out.append(part)
+                prev_line = part
+                continue
+
+            num = m.group(1)
+            rest = m.group(2).strip()
+
+            # ---------------------------
+            # ✅ CAS SPECIAL: montant cassé
+            # ex: prev_line = "... 7.172"
+            #     current   = "55) euros ..."
+            # => recoller "7.172,55 euros"
+            # ---------------------------
+            if len(num) == 2 and prev_looks_like_amount(prev_line) and rest.lower().startswith(("eur", "euro", "chf", "usd", "tnd")):
+                # recolle virgule
+                fixed = re.sub(r"(\d{1,3}(?:[.\s]\d{3})+|\d+)$", r"\1," + num, prev_line)
+                # remplace la dernière ligne par la version fixée
+                if out:
+                    out[-1] = fixed + " " + rest
+                else:
+                    out.append(fixed + " " + rest)
+                prev_line = out[-1]
+                continue
+
+            # ---------------------------
+            # ✅ Validation vrai item
+            # ---------------------------
+            if looks_like_real_item(rest):
                 if out and out[-1] != "":
                     out.append("")
-                out.append(part)
+                out.append(f"{num}) {rest}".strip())
             else:
+                # faux item => colle à l'item précédent
                 out.append(part)
 
+            prev_line = out[-1]
+
     return "\n".join(out).strip()
+
+def heal_broken_amounts(text: str) -> str:
+    # recolle motif: "7.172" newline "55) euros" -> "7.172,55 euros"
+    text = re.sub(
+        r"(\d+\.\d{3})\s*\n\s*(\d{2})\)\s*(euros?|eur|€)",
+        r"\1,\2 \3",
+        text,
+        flags=re.IGNORECASE
+    )
+    return text
 
 def looks_like_date(s: Any) -> bool:
     if not isinstance(s, str):
@@ -474,7 +513,6 @@ def fold_orphan_items_as_reimputations(ext: Dict[str, Any]) -> Dict[str, Any]:
         else:
             cleaned.append(it)
 
-    # on attache les orphans au DERNIER item réel (souvent item 8/9)
     if cleaned and orphans:
         parent = cleaned[-1]
         if "reimputations" not in parent or parent["reimputations"] is None:
@@ -490,6 +528,78 @@ def fold_orphan_items_as_reimputations(ext: Dict[str, Any]) -> Dict[str, Any]:
 
     ext["items"] = cleaned
     return ext
+
+def cut_footer_duplicates(items_text: str) -> str:
+    lines = items_text.splitlines()
+    seen = set()
+    max_num = 0
+
+    for l in lines:
+        m = re.match(r"^(\d{1,3})\)", l.strip())
+        if m:
+            n = int(m.group(1))
+            max_num = max(max_num, n)
+
+    out = []
+    for l in lines:
+        m = re.match(r"^(\d{1,3})\)", l.strip())
+        if m:
+            n = int(m.group(1))
+            if n in seen and n <= max_num:
+                break
+            seen.add(n)
+        out.append(l)
+
+    return "\n".join(out).strip()
+
+def extract_main_amount(raw_text: str):
+    """
+    Retourne le montant principal + devise la plus probable autour.
+    Tolérant aux fautes OCR (eurcs, euos, etc.)
+    """
+    if not isinstance(raw_text, str):
+        return None, None, None, None
+
+    txt = raw_text
+
+    cleaned = re.sub(
+        r"\b(titre(?:\s+export)?)(?:\s*n?[°o'Pp]?\s*|[\s:/-]+)\s*\d{5,}\b",
+        " ",
+        txt,
+        flags=re.I
+    )
+    cleaned = re.sub(
+        r"\b(facture|fact|FACT)\s*(?:n[°o]\s*)?[:#]?\s*\d{1,4}\s*/\s*\d{2,4}\b",
+        " ",
+        cleaned,
+        flags=re.I
+    )
+
+    # 1) cherche le PREMIER vrai montant
+    mm = re.search(r"(\d{1,3}(?:[.\s]\d{3})*(?:,\d{2})?|\d+(?:,\d{2})?)", cleaned)
+
+    if not mm:
+        return None, None, None, None
+
+    amount_raw = mm.group(1).strip()
+    amount_num = to_float(amount_raw)
+
+    # 2) cherche devise DANS LES 20 caractères après le montant
+    start = mm.end()
+    window = cleaned[start:start+20]
+
+    md = re.search(r"\b(chf|usd|tnd|euro?s?|eur\w*)\b", window, re.I)
+    devise_raw = md.group(1) if md else None
+
+    dv_norm = None
+    if devise_raw:
+        dv = devise_raw.upper()
+        if dv.startswith("EUR") or "EURO" in dv:
+            dv_norm = "EUR"
+        else:
+            dv_norm = dv
+
+    return amount_raw, devise_raw, amount_num, dv_norm
 
 # ---------------------------
 # F) Stage runners (prompt par prompt)
@@ -518,7 +628,6 @@ def run_items_ocr_only_easyocr(img_path: str, use_enhanced=True) -> str:
     path_for_ocr = enhance_image_for_ocr(img_path) if use_enhanced else img_path
     txt = ocr_text(path_for_ocr)
 
-    # on renvoie le texte brut (sans tentative de structuration)
     return txt
 
 
@@ -550,55 +659,6 @@ def run_generic_extraction(llm, data_url: str, ocr_txt: str, doc_type: str) -> D
 # G) Post-processing final schema
 # ---------------------------
 
-# def post_process_etat_apurement(ext: Dict[str, Any], page_filename: str) -> Dict[str, Any]:
-#     # récupère date d’en-tête si le LLM l’a mise
-#     header_date = ext.get("date_document")
-
-#     for it in ext.get("items", []):
-#         if not isinstance(it, dict):
-#             continue
-
-#         # numero_item -> chiffres uniquement
-#         if it.get("numero_item"):
-#             m = re.search(r"\d{1,2}", str(it["numero_item"]))
-#             it["numero_item"] = m.group(0) if m else it["numero_item"]
-
-#         # num_dom nettoyage
-#         it["num_dom"] = clean_titre_no(it.get("num_dom"))
-
-#         # si num_dom trop court -> null
-#         if it.get("num_dom") and len(str(it["num_dom"])) < 5:
-#             it["num_dom"] = None
-
-#         # montant float
-#         it["mnt_reglement"] = to_float(it.get("mnt_reglement"))
-
-#         # si num_dom == montant -> annuler num_dom
-#         if it.get("num_dom") and it.get("mnt_reglement") is not None:
-#             try:
-#                 nd = str(it["num_dom"])
-#                 mt = str(int(float(it["mnt_reglement"])))
-#                 if nd == mt:
-#                     it["num_dom"] = None
-#             except:
-#                 pass
-
-#         # devise normalisée
-#         d = it.get("devise")
-#         if isinstance(d, str) and "EURO" in d.upper():
-#             it["devise"] = "EUR"
-
-#         # ✅ anti-fuite date en-tête
-#         if header_date and it.get("date_dom") == header_date:
-#             it["date_dom"] = None
-#         # ou si date_dom == date du doc dans le texte
-#         if it.get("date_dom") and re.search(r"\b20/05/2025\b", str(it["date_dom"])):
-#             it["date_dom"] = None
-
-#         # page
-#         it["page"] = page_filename
-
-#     return ext
 def post_process_etat_apurement(ext: Dict[str, Any], page_filename: str) -> Dict[str, Any]:
     header_date = ext.get("date_document")
 
@@ -617,7 +677,12 @@ def post_process_etat_apurement(ext: Dict[str, Any], page_filename: str) -> Dict
         if it.get("num_dom") and len(str(it["num_dom"])) < 5:
             it["num_dom"] = None
 
-        it["mnt_reglement"] = to_float(it.get("mnt_reglement"))
+        if it.get("mnt_reglement_raw") is None:
+            # si pas de RAW, on garde le numérique (ou on tente float)
+            it["mnt_reglement"] = to_float(it.get("mnt_reglement"))
+        else:
+            # si RAW existe, mnt_reglement = texte tel quel
+            it["mnt_reglement"] = it["mnt_reglement_raw"]
 
         # devise normalisée
         d = it.get("devise")
@@ -630,11 +695,11 @@ def post_process_etat_apurement(ext: Dict[str, Any], page_filename: str) -> Dict
         if it.get("date_dom") and re.search(r"\b20/05/2025\b", str(it["date_dom"])):  # optionnel
             it["date_dom"] = None
 
-        # ✅ facture : si c'est juste une année -> null
+        # facture : si c'est juste une année -> null
         if it.get("facture") and re.fullmatch(r"\d{4}", str(it["facture"]).strip()):
             it["facture"] = None
 
-        # ✅ justificatif: tu ne veux PAS Avance/Surplus/Manque ici
+        # justificatif: tu ne veux PAS Avance/Surplus/Manque ici
         if it.get("justificatif"):
             it["justificatif"] = None
 
@@ -678,6 +743,7 @@ def process_document(
         if stage == "items_ocr":
             items_text = run_items_ocr_only_easyocr(path, use_enhanced=True)
             items_text = normalize_items_text(items_text)
+            items_text = heal_broken_amounts(items_text)
             results.append({"page": page_file, "items_text": items_text})
             continue
 
@@ -685,6 +751,8 @@ def process_document(
         if stage == "structure_items":
             items_text = run_items_ocr_only_easyocr(path, use_enhanced=True)
             items_text = normalize_items_text(items_text)
+            items_text = heal_broken_amounts(items_text)
+            items_text = cut_footer_duplicates(items_text)
 
 
             # 1) construire item_text_map
@@ -696,7 +764,7 @@ def process_document(
                 m = re.match(r"^(\d{1,2})\s*[\)\.\-:]\s*(.*)$", s)
                 if m:
                     if current_num is not None:
-                        item_text_map[current_num] = " ".join(current_lines).strip()
+                        item_text_map[current_num] = "\n".join(current_lines).strip()
                     current_num = m.group(1)
                     current_lines = [m.group(2).strip()]
                 else:
@@ -704,39 +772,59 @@ def process_document(
                         current_lines.append(s)
 
             if current_num is not None:
-                item_text_map[current_num] = " ".join(current_lines).strip()
+                item_text_map[current_num] = "\n".join(current_lines).strip()
 
             # 2) structuration LLM
             ext = run_structure_items(llm, items_text)
 
             # forcer numero_item à partir de l'ordre réel
-            real_nums = list(item_text_map.keys())  # ex: ["1","2","3"...]
+            real_nums = list(item_text_map.keys()) 
             for i, it in enumerate(ext.get("items", [])):
                 if i < len(real_nums):
                     it["numero_item"] = real_nums[i]
 
             # 3) ajouter reimputations par item
+            # 3) ajouter reimputations + override fiable
             for it in ext.get("items", []):
                 if not isinstance(it, dict):
                     continue
+
                 num = str(it.get("numero_item", "")).strip()
                 raw_text = item_text_map.get(num, "")
-                # ---- override num_dom & facture depuis texte brut (fiable) ----
-                mt = re.search(r"(titre(?:\s+export)?\s*n[°o'Pp]?\s*)(\d{5,})", raw_text, re.IGNORECASE)
-                if mt:
-                    it["num_dom"] = mt.group(2)
 
+                # --- num_dom fiable ---
+                mt = re.search(
+                    r"\b(titre(?:\s+export)?)(?:\s*n[°o'Pp]?\s*|[\s:/-]+)\s*(\d{5,})\b",
+                    raw_text,
+                    re.IGNORECASE
+                )
+                it["num_dom"] = mt.group(2) if mt else None   
+
+                # --- facture fiable ---
                 mf = re.search(
                     r"(?:facture|fact|FACT)\s*(?:n[°o]\s*)?[:#]?\s*(\d{1,4}\s*/\s*\d{2,4})",
                     raw_text,
                     re.IGNORECASE
                 )
-                if mf:
-                    it["facture"] = mf.group(1).replace(" ", "")
+                it["facture"] = mf.group(1).replace(" ", "") if mf else None 
+                  # --- mnt_reglement fiable si LLM l'a raté ---
+             
+                mr = it.get("mnt_reglement")
+                if mr is None or (isinstance(mr, str) and not mr.strip()):
+                    amt_raw, dv_raw, amt_num, dv_norm = extract_main_amount(raw_text)
+
+                    if amt_num is not None:
+                        it["mnt_reglement_raw"] = amt_raw
+                        it["devise_raw"] = dv_raw
+
+                        it["mnt_reglement"] = amt_num
+                        if dv_norm:
+                            it["devise"] = dv_norm
+
+
+                # réimputations
                 it["reimputations"] = extract_reimputations(raw_text)
 
-            ext = fold_orphan_items_as_reimputations(ext)
-            ext = post_process_etat_apurement(ext, page_file)
 
             # 4) post process final
             ext = post_process_etat_apurement(ext, page_file)
