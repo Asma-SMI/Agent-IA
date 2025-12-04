@@ -14,6 +14,10 @@ import cv2
 import numpy as np
 import easyocr
 
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
 from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -26,8 +30,55 @@ SUPPORTED_IMAGE_EXTS = {
     ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".gif"
 }
 SUPPORTED_PDF_EXTS = {".pdf"}
+SUPPORTED_XLSX_EXTS = {".xlsx", ".xls"}
 
-#Objectif : transformer n’importe quel document en liste d’images PNG.
+def xlsx_to_image_paths(xlsx_path: str, out_dir: str) -> List[str]:
+    """
+    Convertit chaque sheet Excel en image PNG.
+    Retourne une liste de paths.
+    """
+    xls = pd.ExcelFile(xlsx_path)
+    base = os.path.splitext(os.path.basename(xlsx_path))[0]
+    paths = []
+
+    for i, sheet_name in enumerate(xls.sheet_names):
+        df = xls.parse(sheet_name)
+
+        # Si sheet vide -> skip
+        if df.empty:
+            continue
+
+        # Nettoyage des NaN pour affichage
+        df = df.fillna("")
+
+        # Heuristique taille fig
+        n_rows, n_cols = df.shape
+        fig_w = max(8, n_cols * 1.2)
+        fig_h = max(2, n_rows * 0.35)
+
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        ax.axis("off")
+
+        tbl = ax.table(
+            cellText=df.values,
+            colLabels=[str(c) for c in df.columns],
+            cellLoc="left",
+            loc="center"
+        )
+
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(8)
+        tbl.scale(1, 1.2)
+
+        out_path = os.path.join(out_dir, f"{base}_sheet_{i:03d}.png")
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+        paths.append(out_path)
+
+    return paths
+
+
 def split_document_to_image_paths(
     input_path: str,
     out_dir: Optional[str] = None,
@@ -43,7 +94,6 @@ def split_document_to_image_paths(
     paths = []
     base = os.path.splitext(os.path.basename(input_path))[0]
 
-    #si PDF
     if ext in SUPPORTED_PDF_EXTS:
         doc = fitz.open(input_path)
         for i, page in enumerate(doc):
@@ -53,8 +103,7 @@ def split_document_to_image_paths(
             paths.append(out_path)
         doc.close()
         return paths
-    
-    #Si TIFF/GIF multi-frames
+
     if ext in {".tif", ".tiff", ".gif"}:
         frames = imageio.mimread(input_path)
         for i, frame in enumerate(frames):
@@ -64,11 +113,13 @@ def split_document_to_image_paths(
             paths.append(out_path)
         return paths
 
-    #Si image simple
     if ext in SUPPORTED_IMAGE_EXTS:
         out_path = os.path.join(out_dir, f"{base}_page_000.png")
         Image.open(input_path).save(out_path)
         return [out_path]
+    
+    if ext in SUPPORTED_XLSX_EXTS:
+        return xlsx_to_image_paths(input_path, out_dir)
 
     raise ValueError(f"Unsupported file type: {ext}")
 
@@ -77,7 +128,7 @@ def split_document_to_image_paths(
 # B) Prompts
 # ---------------------------
 
-# Prompt classify pour déterminer le type de document
+# Prompt classify
 CLASSIFIER_PROMPT = """
 Tu es un système de classification de documents.
 Analyse l'image fournie et identifie le type de document.
@@ -131,7 +182,7 @@ Important:
 - Ne change JAMAIS "Avance" en "Surplus" ou l’inverse. Copie mot à mot.
 """
 
-# Prompt structuration en prendre le texte OCR déjà découpé en items et produire un JSON structuré. (pour type etat apurement)
+# Prompt structuration V2 (aligné sur tes champs finaux)
 STRUCTURE_FROM_TEXT_PROMPT_V2 = """
 Tu reçois le texte OCR d’un ETAT D’APUREMENT item par item.
 
@@ -157,8 +208,8 @@ RÈGLES CRITIQUES:
 - Ne prends JAMAIS un montant comme num_dom.
 
 3) facture:
-- Extrais facture seulement si tu vois "Facture" ou "Fact" ou "FACT" ou "Facture Export"
-  (avec variantes No/NP/N?/NO)
+- Extrais facture seulement si tu vois "Facture" ou "Fact" ou "FACT" ou "Facture Export" ou "Facture Export N°"
+ou "Facture Export N'" ou "Facture Export No"
   suivi d’un numéro de type 058/2014, 23/14, 5/2014, etc.
 - facture = "058/2014" ou "23/14" etc.
 - Si absent -> null.
@@ -168,11 +219,6 @@ RÈGLES CRITIQUES:
 - devise = devise associée à ce montant principal (CHF/EUR/TND/USD).
 - Ignore la devise des phrases "à apurer par ..." et des réimputations.
 
-5) reimputations:
-- Sous-lignes qui contiennent "Titre ... (Fact ..) = montant devise"
-- Elles peuvent commencer par "-" OU directement par "Titre".
-- Pour chaque réimputation, extrais:
-  num_dom, facture, mnt_reglement, devise.
 
 IMPORTANT:
 - Ne devine rien.
@@ -190,14 +236,13 @@ Réponds UNIQUEMENT en JSON valide:
       "mnt_reglement": null,
       "devise": null,
       "date_reglement": null,
-      "facture": null,
-      "reimputations": []
+      "facture": null
     }}
   ]
 }}
 """
 
-# Extraction générique (si doc_type != etat_apurement) Pour tous les autres types de docs
+# # Extraction générique (si doc_type != etat_apurement)
 EXTRACTOR_PROMPT_GENERIC = """
 Tu es un extracteur d'information pour docuCourtments.
 Type de document détecté : {doc_type}
@@ -218,7 +263,6 @@ Réponds UNIQUEMENT en JSON valide.
 Format obligatoire:
 {
   "doc_type": "{doc_type}",
-  "ia_reg": null,
   "num_dom": null,
   "date_dom": null,
   "mnt_reglement": null,
@@ -244,12 +288,10 @@ PROMPTS_BY_TYPE = {
 def build_llm(model_name: str = "gemma3:latest"):
     return ChatOllama(model=model_name, temperature=0)
 
-
 # ---------------------------
 # D) Image enhancement + OCR
 # ---------------------------
 
-#augmenter recall OCR sur scans pourris (pour reduire plus le bruit)
 def enhance_image_for_ocr(img_path: str) -> str:
     img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -264,7 +306,7 @@ def enhance_image_for_ocr(img_path: str) -> str:
     cv2.imwrite(out_path, img)
     return out_path
 
-#renvoie un texte simple
+
 _reader = None
 def ocr_text(img_path: str) -> str:
     global _reader
@@ -282,7 +324,6 @@ def ocr_text(img_path: str) -> str:
 # E) Helpers
 # ---------------------------
 
-#nettoie les json si le LLM envoie un bloc markdown
 def safe_json_loads(text: str) -> Dict[str, Any]:
     text = text.strip()
     if text.startswith("```"):
@@ -290,7 +331,7 @@ def safe_json_loads(text: str) -> Dict[str, Any]:
         text = text.replace("json", "", 1).strip()
     return json.loads(text)
 
-#remap des variantes “reçu bancaire”, “état d'apurement”… → forme canonique.
+
 def normalize_doc_type(doc_type: str) -> str:
     if not doc_type:
         return "autre"
@@ -306,7 +347,7 @@ def normalize_doc_type(doc_type: str) -> str:
     }
     return mapping.get(dt, dt)
 
-#convertit l’image locale en data:image/png;base64,...nécessaire pour LangChain vision.
+
 def image_path_to_data_url(path: str) -> str:
     mime, _ = mimetypes.guess_type(path)
     if mime is None:
@@ -315,7 +356,7 @@ def image_path_to_data_url(path: str) -> str:
         b64 = base64.b64encode(f.read()).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
-#convert to float , none si impo
+
 def to_float(x):
     if isinstance(x, (int, float)):
         return float(x)
@@ -326,7 +367,7 @@ def to_float(x):
             return None
     return None
 
-#prend une string et extrait un nombre ≥5 chiffres (ex : Titre N° 123456 → "123456")
+
 def clean_titre_no(x: Any) -> Optional[str]:
     if not isinstance(x, str):
         return x
@@ -338,68 +379,26 @@ def clean_facture_no(x: Any) -> Optional[str]:
     if not isinstance(x, str):
         return None
 
-    s = x.strip()
+    t = x.strip()
 
-    facture_kw = r"(?:facture|FACT|fact\.?)"
+    facture_kw = r"(?:facture|faxture|fact\.?)"
     export_kw  = r"(?:\s*(?:export|exp|expor|exprt|expt))?"
-    num_kw     = r"(?:\s*(?:n[°o\?\]pP']?|no|np))?"  # N°, No, N?, NP, N'
+    num_kw     = r"(?:\s*(?:n[°o\?\]pP']?|no|np))?"  # N°, No, N?, NP...
 
-    # ✅ cas "Facture Export No 001/2018" etc.
-    m = re.search(
+    mf = re.search(
         rf"{facture_kw}{export_kw}{num_kw}\s*[:#]?\s*(\d{{1,4}}\s*/\s*\d{{2,4}})",
-        s,
-        re.IGNORECASE
+        t,
+        flags=re.IGNORECASE
     )
-    if m:
-        return m.group(1).replace(" ", "")
+    if mf:
+        return mf.group(1).replace(" ", "")
 
-    # ✅ fallback : premier motif 12/13, 061/2013 etc.
-    m2 = re.search(r"(\d{1,4}\s*/\s*\d{2,4})", s)
-    if m2:
-        return m2.group(1).replace(" ", "")
+    # fallback simple si pas de mot-clé mais format facture présent
+    mf2 = re.search(r"(\d{1,4}\s*/\s*\d{2,4})", t)
+    return mf2.group(1).replace(" ", "") if mf2 else None
 
-    return None
 
-#Parcourt chaque ligne : garde celles qui commencent par - ou Titre
-#extrait :data puis renvoie liste de réimputations.
-def extract_reimputations(raw_text: str) -> List[Dict[str, Any]]:
-    if not isinstance(raw_text, str):
-        return []
 
-    reimps = []
-    for line in raw_text.splitlines():
-        l = line.strip()
-
-        if not (l.startswith("-") or re.match(r"^titre", l, re.IGNORECASE)):
-            continue
-
-        titre_no = None
-        mtitre = re.search(r"(titre(?:\s+export)?\s*n[°o]?\s*)(\d{5,})", l, re.IGNORECASE)
-        if mtitre:
-            titre_no = mtitre.group(2)
-
-        facture_no = clean_facture_no(l)
-
-        mmontant = re.search(r"=\s*([0-9\.\s]+(?:,[0-9]+)?)", l)
-        montant = to_float(mmontant.group(1)) if mmontant else None
-
-        mdev = re.search(r"\b(EUR|EUROS?|CHF|TND|USD)\b", l, re.IGNORECASE)
-        devise = None
-        if mdev:
-            dv = mdev.group(1).upper()
-            devise = "EUR" if "EURO" in dv else dv
-
-        reimps.append({
-            "num_dom": titre_no,
-            "facture": facture_no,
-            "mnt_reglement": montant,
-            "devise": devise
-        })
-
-    return [r for r in reimps if any(v is not None for v in r.values())]
-
-#Un des bouts les plus importants :
-#il essaye de reconstruire l’énumération d’items
 def normalize_items_text(ocr_txt: str) -> str:
     if not ocr_txt:
         return ocr_txt
@@ -413,8 +412,7 @@ def normalize_items_text(ocr_txt: str) -> str:
         "une", "un", "avance", "surplus", "manque",
         "a apurer", "apurer", "apuré", "apuré par",
         "réimputer", "ré imput", "reimputer",
-        "facture", "fact", "facture export", "facture exp",
-        "facture expor", "facture exprt"
+        "facture", "fact", "facture export",
     ]
 
     def looks_like_real_item(rest: str) -> bool:
@@ -508,41 +506,6 @@ def looks_like_date(s: Any) -> bool:
         )
     )
 
-#Si le LLM a créé un item “orphelin” (pas de numero_item mais ressemble à réimputation)
-#→ on l’ajoute à la fin du parent précédent.
-def fold_orphan_items_as_reimputations(ext: Dict[str, Any]) -> Dict[str, Any]:
-    items = ext.get("items", [])
-    if not items:
-        return ext
-
-    cleaned = []
-    orphans = []
-
-    for it in items:
-        num_item = it.get("numero_item")
-        # orphan = item sans numero_item mais qui ressemble à une réimputation
-        if (num_item is None or str(num_item).strip() == "") and it.get("num_dom") and it.get("mnt_reglement"):
-            orphans.append(it)
-        else:
-            cleaned.append(it)
-
-    if cleaned and orphans:
-        parent = cleaned[-1]
-        if "reimputations" not in parent or parent["reimputations"] is None:
-            parent["reimputations"] = []
-
-        for o in orphans:
-            parent["reimputations"].append({
-                "num_dom": clean_titre_no(o.get("num_dom")),
-                "facture": clean_facture_no(o.get("facture")),
-                "mnt_reglement": to_float(o.get("mnt_reglement")),
-                "devise": o.get("devise")
-            })
-
-    ext["items"] = cleaned
-    return ext
-
-#Coupe la répétition d’items dans les pieds de page
 def cut_footer_duplicates(items_text: str) -> str:
     lines = items_text.splitlines()
     seen = set()
@@ -615,11 +578,60 @@ def extract_main_amount(raw_text: str):
 
     return amount_raw, devise_raw, amount_num, dv_norm
 
+def override_fields_from_raw_text(it: Dict[str, Any], raw_text: str) -> None:
+    if not raw_text:
+        return
+
+    t = raw_text
+
+    # -------- facture (Facture Export NO / N? / NP / No / etc.) ----------
+    it["facture"] = clean_facture_no(t)
+
+    # -------- num_dom (Titre No / N° / N? / NP...) ----------
+    mt = re.search(
+        r"\b(titre(?:\s+export)?)(?:\s*(?:n[°o\?\]pP']?|no|np))?\s*(\d{5,})\b",
+        t,
+        re.IGNORECASE
+    )
+    it["num_dom"] = mt.group(2) if mt else None
+
+    # -------- date_dom : seulement si liée au Titre ----------
+    md = re.search(
+        r"\b(titre(?:\s+export)?)(?:\s*(?:n[°o\?\]pP']?|no|np))?\s*\d{5,}\s*du\s*"
+        r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        t,
+        re.IGNORECASE
+    )
+    it["date_dom"] = md.group(2) if md else None
+
+    # -------- montant principal + devise ----------
+    # On coupe dès qu’on atteint une sous-ligne "-" ou "Lettre du"
+    main_part_lines = []
+    for line in t.splitlines():
+        ls = line.strip()
+        if ls.startswith("-") or re.search(r"\blettre du\b", ls, re.I):
+            break
+        main_part_lines.append(ls)
+
+    main_part = " ".join(main_part_lines)
+
+    mm = re.search(
+        r"([0-9]{1,3}(?:[.\s][0-9]{3})*(?:,[0-9]{2})?)",
+        main_part
+    )
+    it["mnt_reglement"] = to_float(mm.group(1)) if mm else None
+
+    mdev = re.search(r"\b(EUR|EUROS?|CHF|TND|USD)\b", main_part, re.IGNORECASE)
+    if mdev:
+        dv = mdev.group(1).upper()
+        it["devise"] = "EUR" if "EURO" in dv else dv
+    else:
+        it["devise"] = None
+
 # ---------------------------
 # F) Stage runners (prompt par prompt)
 # ---------------------------
 
-#Envoie image+OCR au LLM avec CLASSIFIER_PROMPT → JSON classification.
 def run_classification(llm, data_url: str, ocr_txt: str) -> Dict[str, Any]:
     msgs = [
         SystemMessage(content=CLASSIFIER_PROMPT),
@@ -637,7 +649,7 @@ def run_classification(llm, data_url: str, ocr_txt: str) -> Dict[str, Any]:
     cls["doc_type"] = normalize_doc_type(cls.get("doc_type", "autre"))
     return cls
 
-#Juste OCR EasyOCR après enhancement → texte brut.
+
 def run_items_ocr_only_easyocr(img_path: str, use_enhanced=True) -> str:
     # OCR sur image améliorée pour max recall
     path_for_ocr = enhance_image_for_ocr(img_path) if use_enhanced else img_path
@@ -645,14 +657,14 @@ def run_items_ocr_only_easyocr(img_path: str, use_enhanced=True) -> str:
 
     return txt
 
-#Envoie items_text au LLM (prompt V2) → JSON items.
+
 def run_structure_items(llm, items_text: str) -> Dict[str, Any]:
     prompt = STRUCTURE_FROM_TEXT_PROMPT_V2.format(items_text=items_text)
     msgs = [SystemMessage(content=prompt)]
     raw = llm.invoke(msgs).content
     return safe_json_loads(raw)
 
-#Envoie prompt générique au LLM avec image + OCR → JSON simple.
+
 def run_generic_extraction(llm, data_url: str, ocr_txt: str, doc_type: str) -> Dict[str, Any]:
     prompt = PROMPTS_BY_TYPE.get(doc_type, EXTRACTOR_PROMPT_GENERIC).format(doc_type=doc_type)
     msgs = [
@@ -674,7 +686,6 @@ def run_generic_extraction(llm, data_url: str, ocr_txt: str, doc_type: str) -> D
 # G) Post-processing final schema
 # ---------------------------
 
-#Une passe finale très importante : But : corriger ce que le LLM a mal sorti.
 def post_process_etat_apurement(ext: Dict[str, Any], page_filename: str) -> Dict[str, Any]:
     header_date = ext.get("date_document")
 
@@ -715,8 +726,6 @@ def post_process_etat_apurement(ext: Dict[str, Any], page_filename: str) -> Dict
         if it.get("facture") and re.fullmatch(r"\d{4}", str(it["facture"]).strip()):
             it["facture"] = None
 
-        
-
         it["page"] = page_filename
 
     return ext
@@ -725,7 +734,6 @@ def post_process_etat_apurement(ext: Dict[str, Any], page_filename: str) -> Dict
 # H) Full pipeline + staging
 # ---------------------------
 
-#le chef d’orchestre
 def process_document(
     input_path: str,
     model_name: str = "gemma3:latest",
@@ -769,55 +777,96 @@ def process_document(
             items_text = heal_broken_amounts(items_text)
             items_text = cut_footer_duplicates(items_text)
 
-
-            # 1) construire item_text_map
+            # 1) construire item_text_map (version filtrée)
             item_text_map = {}
             current_num = None
             current_lines = []
+
+            ITEM_START_WORDS = [
+                "une", "un", "avance", "surplus", "manque",
+                "a apurer", "apurer", "apuré", "apuré par",
+                "réimputer", "ré imput", "reimputer",
+                "facture", "fact", "facture export",
+            ]
+
+            def looks_like_real_item(rest: str) -> bool:
+                if not rest:
+                    return False
+                r = rest.strip().lower()
+                return any(r.startswith(w) for w in ITEM_START_WORDS)
+
             for line in items_text.splitlines():
                 s = line.strip()
+                if not s:
+                    continue
+
                 m = re.match(r"^(\d{1,2})\s*[\)\.\-:]\s*(.*)$", s)
                 if m:
+                    num = m.group(1)
+                    rest = m.group(2).strip()
+
+                    # ✅ si numéro seul ou faux item => on colle à l’item courant
+                    if not looks_like_real_item(rest):
+                        if current_num is not None:
+                            current_lines.append(s)   # garde la ligne brute
+                        continue
+
+                    # ✅ vrai nouvel item
                     if current_num is not None:
                         item_text_map[current_num] = "\n".join(current_lines).strip()
-                    current_num = m.group(1)
-                    current_lines = [m.group(2).strip()]
-                else:
-                    if current_num is not None and s:
-                        current_lines.append(s)
+
+                    current_num = num
+                    current_lines = [rest]
+                    continue
+
+                # ligne normale
+                if current_num is not None:
+                    current_lines.append(s)
 
             if current_num is not None:
                 item_text_map[current_num] = "\n".join(current_lines).strip()
 
-            # 2) structuration LLM
-            ext = run_structure_items(llm, items_text)
-            # FALLBACK: si LLM a sous-détecté les items, on complète
-            real_nums = list(item_text_map.keys())
-            llm_items = ext.get("items", [])
 
-            if len(llm_items) < len(real_nums):
-                for _ in range(len(real_nums) - len(llm_items)):
-                    llm_items.append({
-                        "numero_item": None,
+            # 2) structuration LLM
+            # ext = run_structure_items(llm, items_text)
+
+            # # forcer numero_item à partir de l'ordre réel
+            # real_nums = list(item_text_map.keys()) 
+            # for i, it in enumerate(ext.get("items", [])):
+            #     if i < len(real_nums):
+            #         it["numero_item"] = real_nums[i]
+
+                    # 2) structuration LLM
+            ext = run_structure_items(llm, items_text)
+
+            # ✅ PATCH: si le LLM n'a pas sorti tous les items,
+            # on reconstruit la liste depuis item_text_map
+            real_nums = list(item_text_map.keys())
+
+            if not isinstance(ext.get("items"), list) or len(ext["items"]) < len(real_nums):
+                ext["items"] = [
+                    {
+                        "numero_item": n,
                         "num_dom": None,
                         "date_dom": None,
                         "mnt_reglement": None,
                         "devise": None,
                         "date_reglement": None,
-                        "facture": None,
-                        "reimputations": []
-                    })
+                        "facture": None
+                    }
+                    for n in real_nums
+                ]
+            else:
+                # Sinon on force juste le numero_item dans l'ordre réel
+                for i, it in enumerate(ext.get("items", [])):
+                    if i < len(real_nums):
+                        it["numero_item"] = real_nums[i]
 
-            ext["items"] = llm_items
+                # ✅ NEW: couper les items en trop (évite doublons)
+                ext["items"] = ext.get("items", [])[:len(real_nums)]
 
-            # forcer numero_item à partir de l'ordre réel
-            real_nums = list(item_text_map.keys()) 
-            for i, it in enumerate(ext.get("items", [])):
-                if i < len(real_nums):
-                    it["numero_item"] = real_nums[i]
 
-            # 3) ajouter reimputations par item
-            # 3) ajouter reimputations + override fiable
+            # 3) override fiable + reimputations
             for it in ext.get("items", []):
                 if not isinstance(it, dict):
                     continue
@@ -825,39 +874,10 @@ def process_document(
                 num = str(it.get("numero_item", "")).strip()
                 raw_text = item_text_map.get(num, "")
 
-                # --- num_dom fiable ---
-                mt = re.search(
-                    r"\b(titre(?:\s+export)?)(?:\s*n[°o'Pp]?\s*|[\s:/-]+)\s*(\d{5,})\b",
-                    raw_text,
-                    re.IGNORECASE
-                )
-                it["num_dom"] = mt.group(2) if mt else None   
-
-                # --- facture fiable ---
-                # mf = re.search(
-                #     r"(?:facture|fact|FACT)\s*(?:n[°o]\s*)?[:#]?\s*(\d{1,4}\s*/\s*\d{2,4})",
-                #     raw_text,
-                #     re.IGNORECASE
-                # )
-                # it["facture"] = mf.group(1).replace(" ", "") if mf else None 
-                it["facture"] = clean_facture_no(raw_text)
-                  # --- mnt_reglement fiable si LLM l'a raté ---
-             
-                mr = it.get("mnt_reglement")
-                if mr is None or (isinstance(mr, str) and not mr.strip()):
-                    amt_raw, dv_raw, amt_num, dv_norm = extract_main_amount(raw_text)
-
-                    if amt_num is not None:
-                        it["mnt_reglement_raw"] = amt_raw
-                        it["devise_raw"] = dv_raw
-
-                        it["mnt_reglement"] = amt_num
-                        if dv_norm:
-                            it["devise"] = dv_norm
+                # ✅ override sûr (écrase ce que LLM a mis)
+                override_fields_from_raw_text(it, raw_text)
 
 
-                # réimputations
-                it["reimputations"] = extract_reimputations(raw_text)
 
 
             # 4) post process final
@@ -906,13 +926,6 @@ def process_document(
                 # structuration LLM
                 ext = run_structure_items(llm, items_text)
 
-                # ajout réimputations
-                for it in ext.get("items", []):
-                    if not isinstance(it, dict):
-                        continue
-                    num = str(it.get("numero_item", "")).strip()
-                    raw_text = item_text_map.get(num, "")
-                    it["reimputations"] = extract_reimputations(raw_text)
 
                 # post-process final
                 ext = post_process_etat_apurement(ext, page_file)
@@ -938,11 +951,12 @@ def process_document(
         "pages": results
     }
 
+
+
 # ---------------------------
 # I) CLI
 # ---------------------------
 
-#Permet d’exécuter en ligne de commande
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
